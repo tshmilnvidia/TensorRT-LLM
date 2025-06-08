@@ -422,6 +422,10 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
     , mStream{stream}
     , mCacheType{cacheType}
 {
+    mAgentName = std::string("TomerAgent");
+    BaseAgentConfig config{mAgentName, true};
+    mTransferAgent = makeTransferAgent("nixl", &config);
+
     auto const numNonUniqueWindowSizes = static_cast<SizeType32>(maxAttentionWindowVec.size());
 
     std::map<SizeType32, std::vector<SizeType32>> uniqueWindowSizeToLayers;

@@ -28,6 +28,7 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include <NvInferRuntime.h>
 
 #include <cstdint>
@@ -38,6 +39,10 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+
+using tensorrt_llm::executor::kv_cache::BaseTransferAgent;
+using tensorrt_llm::executor::kv_cache::BaseAgentConfig;
+using tensorrt_llm::executor::kv_cache::makeTransferAgent;
 
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
@@ -1131,6 +1136,8 @@ private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
     std::shared_ptr<KVCacheEventManager> mEventManager;
+    std::unique_ptr<BaseTransferAgent> mTransferAgent;
+    std::string mAgentName;
     CudaStreamPtr mStream;
     CacheType mCacheType;
 
