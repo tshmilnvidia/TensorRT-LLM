@@ -804,9 +804,12 @@ BlockPtr WindowBlockManager::getFreeBlock(
     // 2. Eviction policy indicated block can be offloaded
     // 3. At least one free block in secondary memory
     // 4. Onboarding is enabled (allowing block to be brought back into primary)
+    TLLM_LOG_ERROR("Tomer9 - empty = %d, can_offload = %d, num_free = %d, onboard = %d",
+                    block->getUniqueTokens().empty(), canOffload, mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel), mOnboardBlocks);
     if (!block->getUniqueTokens().empty() && canOffload && mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel) > 0
         && mOnboardBlocks)
     {
+        TLLM_LOG_ERROR("Tomer10");
         // If we're swapping a block to secondary memory, maintain the prior priority values.
         mEvictionPolicy->claimBlock(block);
         // Offload block in primary memory before repurposing
@@ -908,11 +911,13 @@ void WindowBlockManager::removeBlockFromHashMap(BlockPtr const& block)
 
 void BlockManager::onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize, executor::KvCacheTransferMode mode, std::optional<std::string> directory)
 {
+    TLLM_LOG_ERROR("Tomer1");
     mWindowBlockManagers.at(windowSize).onboardBlock(offloadBlock, mode, directory);
 }
 
 void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock, executor::KvCacheTransferMode mode, std::optional<std::string> directory)
 {
+    TLLM_LOG_ERROR("Tomer2");
     if (mOnboardBlocks && !offloadBlock->isPrimary())
     {
         auto block = getFreeBlock(executor::KvCacheRetentionConfig::kDefaultRetentionPriority, std::nullopt, mode, directory);
@@ -932,11 +937,13 @@ void WindowBlockManager::onboardBlock(BlockPtr const& offloadBlock, executor::Kv
 
 void BlockManager::offloadBlock(BlockPtr const& block, SizeType32 windowSize, executor::KvCacheTransferMode mode, std::optional<std::string> directory)
 {
+    TLLM_LOG_ERROR("Tomer3");
     mWindowBlockManagers.at(windowSize).offloadBlock(block, mode, directory);
 }
 
 void WindowBlockManager::offloadBlock(BlockPtr const& block, executor::KvCacheTransferMode mode, std::optional<std::string> directory)
 {
+    TLLM_LOG_ERROR("Tomer4");
     if (mOnboardBlocks && block->isPrimary())
     {
         // Offload block in primary memory before repurposing
@@ -1056,6 +1063,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 addBlockToHashMap(matchingBlock);
                 searchRoot = matchingBlock;
             }
+            TLLM_LOG_ERROR("Tomer5");
             onboardBlock(matchingBlock, mode, directory);
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
