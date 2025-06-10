@@ -108,12 +108,12 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
     std::vector<KVCacheBlockPool> const& pools, bool isOffload, int numTokensToCopy, executor::KvCacheTransferMode mode,
     std::optional<std::string> directory)
 {
-    TLLM_LOG_DEBUG("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
+    TLLM_LOG_ERROR("copyBlock entered: srcId=%d, dstId=%d, isOffload=%s, mode=%d", src->getBlockId(), dst->getBlockId(),
         (isOffload ? "true" : "false"), static_cast<int>(mode));
 
     if (mode == executor::KvCacheTransferMode::DRAM)
     {
-        TLLM_LOG_DEBUG("Using DRAM-based copy (GPU <-> CPU) for this block.");
+        TLLM_LOG_ERROR("Using DRAM-based copy (GPU <-> CPU) for this block.");
 
         // Iterate over all pools, partial-copy logic
         for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
@@ -154,9 +154,11 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             }
         }
 
-        TLLM_LOG_DEBUG("copyBlock: DRAM mode complete. Returning...");
+        TLLM_LOG_ERROR("copyBlock: DRAM mode complete. Returning...");
         return;
     }
+
+    TLLM_LOG_ERROR("copyBlock: Non-DRAM mode copy: mode = %d, pool_size = %d", mode, pools.size());
 
     for (size_t poolIdx = 0; poolIdx < pools.size(); ++poolIdx)
     {
@@ -175,7 +177,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 
         if (mode == executor::KvCacheTransferMode::POSIX_DEBUG_FALLBACK)
         {
-            TLLM_LOG_INFO("Forcing POSIX fallback for file: %s", filename.c_str());
+            TLLM_LOG_ERROR("Forcing POSIX fallback for file: %s", filename.c_str());
             if (isOffload)
             {
                 gpuToFilePosix(srcPtr, filename);
@@ -215,7 +217,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         if (status.err != CU_FILE_SUCCESS)
         {
             // Fallback to POSIX
-            TLLM_LOG_WARN(
+            TLLM_LOG_ERROR(
                 "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'", status.err, filename.c_str());
             ::close(fd);
             if (isOffload)
@@ -255,7 +257,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         ::close(fd);
 #else
         // If GDS isn't enabled, fallback to POSIX automatically
-        TLLM_LOG_DEBUG("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
+        TLLM_LOG_ERROR("ENABLE_CUFILE=OFF, so fallback to POSIX for %s", filename.c_str());
         ::close(fd); // close the file opened for GDS
         if (isOffload)
         {
@@ -276,7 +278,7 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
     if (mode != executor::KvCacheTransferMode::DRAM
         && mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
     {
-        TLLM_LOG_DEBUG("Skipping onboard for block %d because it was never previously offloaded to disk",
+        TLLM_LOG_ERROR("Skipping onboard for block %d because it was never previously offloaded to disk",
             offloadBlock->getBlockId());
         return;
     }
