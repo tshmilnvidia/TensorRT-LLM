@@ -222,6 +222,7 @@ if(ENABLE_CUFILE)
         "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required."
     )
   else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_CUFILE=1")
     message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
     target_link_libraries(${SHARED_TARGET} PUBLIC ${CUFILE_LIBRARY})
   endif()

@@ -100,11 +100,12 @@ if(ENABLE_CUFILE)
   find_library(
     CUFILE_LIBRARY
     NAMES cufile
-    HINTS /usr/local/cuda-12.6/targets/x86_64-linux/lib
+    HINTS /usr/local/cuda-12.9/targets/x86_64-linux/lib
           /usr/lib/x86_64-linux-gnu /usr/local/lib)
   if(NOT CUFILE_LIBRARY)
     message(FATAL_ERROR "Could not find cufile library inside container.")
   endif()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DENABLE_CUFILE=1")
   target_link_libraries(${BATCH_MANAGER_STATIC_TARGET} PUBLIC ${CUFILE_LIBRARY})
 endif()
 
