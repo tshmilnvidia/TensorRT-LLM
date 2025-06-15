@@ -221,6 +221,13 @@ public:
     virtual bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) = 0;
 };
 
+class BaseLoopbackAgent
+{
+public:
+    virtual ~BaseLoopbackAgent() = default;
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) = 0;
+};
+
 class DynLibLoader final
 {
 public:
@@ -259,6 +266,20 @@ template <typename... Args>
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    TLLM_THROW("Unknown backend name.");
+}
+
+template <typename... Args>
+[[nodiscard]] std::unique_ptr<BaseLoopbackAgent> makeLoopbackAgent(std::string const& backend, Args&&... args)
+{
+    if (backend == "nixl")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateNixlFuncType = std::unique_ptr<BaseLoopbackAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
+            "libtensorrt_llm_nixl_wrapper.so", "createNixlLoopbackAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");

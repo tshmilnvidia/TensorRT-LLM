@@ -424,7 +424,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
 {
     mAgentName = std::string("TomerAgent");
     BaseAgentConfig config{mAgentName, true};
-    mTransferAgent = makeTransferAgent("nixl", &config);
+    mLoopbackAgent = makeLoopbackAgent("nixl", &config);
 
     auto const numNonUniqueWindowSizes = static_cast<SizeType32>(maxAttentionWindowVec.size());
 

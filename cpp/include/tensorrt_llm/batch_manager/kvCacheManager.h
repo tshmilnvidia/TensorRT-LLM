@@ -40,9 +40,9 @@
 #include <unordered_map>
 #include <vector>
 
-using tensorrt_llm::executor::kv_cache::BaseTransferAgent;
+using tensorrt_llm::executor::kv_cache::BaseLoopbackAgent;
 using tensorrt_llm::executor::kv_cache::BaseAgentConfig;
-using tensorrt_llm::executor::kv_cache::makeTransferAgent;
+using tensorrt_llm::executor::kv_cache::makeLoopbackAgent;
 
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
@@ -1146,7 +1146,7 @@ private:
     SizeType32 mNumLayers;
     SizeType32 mTokensPerBlock;
     std::shared_ptr<KVCacheEventManager> mEventManager;
-    std::unique_ptr<BaseTransferAgent> mTransferAgent;
+    std::unique_ptr<BaseLoopbackAgent> mLoopbackAgent;
     std::string mAgentName;
     CudaStreamPtr mStream;
     CacheType mCacheType;

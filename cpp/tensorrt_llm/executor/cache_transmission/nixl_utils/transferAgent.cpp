@@ -379,6 +379,40 @@ NixlTransferAgent::~NixlTransferAgent()
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
 }
 
+NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
+    : mName{config.mName}
+{
+    nixl_status_t status;
+    auto envPort = common::getEnvNixlPort();
+    uint16_t port = envPort > 0 ? getIncrmentPort(envPort) : getAvailablePort();
+    nixlAgentConfig nixlConfig{config.useProgThread, true, port};
+    mAddress = getAvailableIP() + ":" + std::to_string(port);
+    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+
+    nixl_b_params_t init1;
+    init1["batch_pool_size"]  = std::to_string(8);
+    init1["batch_limit"]      = std::to_string(128);
+    init1["max_request_size"] = std::to_string(16*1024*1024);
+
+    status = mRawAgent->createBackend("GDS", init1, mRawBackend);
+    if (status != NIXL_SUCCESS || !mRawBackend)
+    {
+        TLLM_THROW("Failed to create NIXL backend, status = %d", status);
+    }
+    mExtraParams.backends.push_back(mRawBackend);
+    TLLM_LOG_INFO("NixlLoopbackAgent::NixlLoopbackAgent mAddress: %s", mAddress.c_str());
+}
+
+[[nodiscard]] std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitTransferRequests(TransferRequest const& request)
+{
+    return nullptr;
+}
+
+NixlLoopbackAgent::~NixlLoopbackAgent()
+{
+    TLLM_LOG_DEBUG("NixlLoopbackAgent::~NixlLoopbackAgent");
+}
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -390,6 +424,15 @@ extern "C"
     {
         TLLM_CHECK(config);
         return std::make_unique<NixlTransferAgent>(*config);
+    }
+}
+
+extern "C"
+{
+    std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config)
+    {
+        TLLM_CHECK(config);
+        return std::make_unique<NixlLoopbackAgent>(*config);
     }
 }
 

@@ -97,6 +97,32 @@ private:
     std::vector<char> mDRamDstBuffer;
 };
 
+class NixlLoopbackAgent final : public BaseLoopbackAgent
+{
+public:
+    NixlLoopbackAgent(BaseAgentConfig const& config);
+    ~NixlLoopbackAgent();
+
+    [[nodiscard]] std::unique_ptr<TransferStatus> submitTransferRequests(TransferRequest const& request) override;
+
+    [[nodiscard]] nixlAgent* getRawAgent() const noexcept
+    {
+        return mRawAgent.get();
+    }
+
+    nixl_opt_args_t* getExtraParams() noexcept
+    {
+        return &mExtraParams;
+    }
+
+private:
+    std::unique_ptr<nixlAgent> mRawAgent;
+    nixlBackendH* mRawBackend{};
+    nixl_opt_args_t mExtraParams;
+    std::string mName;
+    std::string mAddress;
+};
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wreturn-type-c-linkage"
@@ -105,6 +131,11 @@ private:
 extern "C"
 {
     [[nodiscard]] std::unique_ptr<BaseTransferAgent> createNixlTransferAgent(BaseAgentConfig const* config);
+}
+
+extern "C"
+{
+    [[nodiscard]] std::unique_ptr<BaseLoopbackAgent> createNixlLoopbackAgent(BaseAgentConfig const* config);
 }
 
 #if defined(__clang__)
