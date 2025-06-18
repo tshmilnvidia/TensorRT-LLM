@@ -23,6 +23,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -107,6 +111,71 @@ public:
 private:
     MemoryType mType;
     std::vector<MemoryDesc> mDescs;
+};
+
+class FileDesc
+{
+public:
+    FileDesc(std::string const& filename, int flags, mode_t mode, int len)
+        : mLen{len}
+    {
+        fd = ::open(filename.c_str(), flags, mode);
+        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s", filename.c_str());
+    }
+
+    FileDesc(FileDesc&& other) noexcept : fd(other.fd) {
+        other.fd = -1;
+        other.mLen = 0;
+    }
+
+    FileDesc& operator=(FileDesc&& other) noexcept {
+        if (this != &other) {
+            if (fd != -1) ::close(fd);
+            fd = other.fd;
+            other.fd = -1;
+            other.mLen = 0;
+        }
+        return *this;
+    }
+
+    ~FileDesc()
+    {
+        if (fd != -1)
+            ::close(fd);
+    }
+
+    [[nodiscard]] uint64_t getFd() const noexcept
+    {
+        return fd;
+    }
+
+    [[nodiscard]] size_t getLen() const noexcept
+    {
+        return mLen;
+    }
+
+    FileDesc(const FileDesc&) = delete;
+    FileDesc& operator=(const FileDesc&) = delete;
+
+private:
+    int fd;
+    int mLen;
+};
+
+class FileDescs
+{
+public:
+    FileDescs(std::vector<FileDesc>& descs) : mDescs(std::move(descs))
+    {
+    }
+
+    [[nodiscard]] std::vector<FileDesc> const& getDescs() const noexcept
+    {
+        return mDescs;
+    }
+
+private:
+    std::vector<FileDesc> mDescs;
 };
 
 using TransferDescs = MemoryDescs;
@@ -221,6 +290,39 @@ public:
     virtual bool checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs) = 0;
 };
 
+class LoopbackRequest
+{
+public:
+    LoopbackRequest(const MemoryDescs& memoryDescs, const FileDescs& fileDescs,
+                    bool isOffload)
+        : mIsOffload{isOffload}
+        , mMemoryDescs{memoryDescs}
+        , mFileDescs{fileDescs}
+    {
+    }
+
+friend class BaseLoopbackAgent;
+
+private:
+    bool  mIsOffload;
+    const MemoryDescs& mMemoryDescs;
+    const FileDescs& mFileDescs;
+};
+
+class BaseLoopbackAgent
+{
+public:
+    virtual ~BaseLoopbackAgent() = default;
+
+    virtual void registerMemory(MemoryDescs const& descs) = 0;
+    virtual void deregisterMemory(MemoryDescs const& descs) = 0;
+    virtual void registerFiles(FileDescs const& descs) = 0;
+    virtual void deregisterFiles(FileDescs const& descs) = 0;
+
+    [[nodiscard]] virtual std::unique_ptr<TransferStatus>
+    submitLoopbackRequests(const MemoryDescs& memoryDescs, const FileDescs& filedescs, bool isOffload) = 0;
+};
+
 class DynLibLoader final
 {
 public:
@@ -259,6 +361,20 @@ template <typename... Args>
         using CreateNixlFuncType = std::unique_ptr<BaseTransferAgent> (*)(BaseAgentConfig const*);
         auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
             "libtensorrt_llm_nixl_wrapper.so", "createNixlTransferAgent");
+        return func(std::forward<Args>(args)...);
+    }
+    TLLM_THROW("Unknown backend name.");
+}
+
+template <typename... Args>
+[[nodiscard]] std::unique_ptr<BaseLoopbackAgent> makeLoopbackAgent(std::string const& backend, Args&&... args)
+{
+    if (backend == "nixl")
+    {
+        auto& loader = DynLibLoader::getInstance();
+        using CreateNixlFuncType = std::unique_ptr<BaseLoopbackAgent> (*)(BaseAgentConfig const*);
+        auto* func = loader.getFunctionPointer<CreateNixlFuncType>(
+            "libtensorrt_llm_nixl_wrapper.so", "createNixlLoopbackAgent");
         return func(std::forward<Args>(args)...);
     }
     TLLM_THROW("Unknown backend name.");
