@@ -7,7 +7,6 @@ import groovy.json.JsonOutput
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import com.nvidia.bloom.CloudManager
-import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.SlurmConfig
 import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
@@ -39,14 +38,15 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
 UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
 
-POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
-POD_TIMEOUT_SECONDS_TMP = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
+POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
+POD_TIMEOUT_SECONDS_SLURM = env.podTimeoutSeconds ? env.podTimeoutSeconds : "79200"  // Use 22 hours to allow for 2 hour of buffer.
 
 // Literals for easier access.
 @Field
@@ -65,12 +65,16 @@ def LLVM_CONFIG = "LLVM"
 LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
+def PYBIND_CONFIG = "Pybind"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (PYBIND_CONFIG) : [(TARNAME) : "pybind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -91,6 +95,18 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
+// GPU types that require open driver
+REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000"]
+
+// GPU types that don't support dynamic driver flashing
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200"]
+
+// ENABLE_NGC_DEVEL_IMAGE_TEST is currently disabled in the Jenkins BuildDockerImageSanityTest job config
+ENABLE_NGC_DEVEL_IMAGE_TEST = params.enableNgcDevelImageTest ?: false
+ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
+
+COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
 def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
@@ -105,7 +121,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         pipeline.stage('Submit Test Results') {
             sh "mkdir -p ${stageName}"
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results/results.xml"
-            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
+            def downloadResultCmd = "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${resultsFilePath} ${stageName}/"
             def downloadSucceed = sh(script: downloadResultCmd, returnStatus: true) == 0
             if (downloadSucceed) {
                 sh "ls ${stageName}"
@@ -124,7 +140,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
 }
 
 //TODO: consolidate slurm related code for both multi nodes and single nodes
-def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID){
+def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jobUID, String slurmOutputFile) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -135,20 +151,58 @@ def cleanUpNodeResourcesMultiNodes(def pipeline, SlurmCluster cluster, String jo
         ]
 
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID}"
-                )
+
+        def slurmJobID = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"sed -n " +
+                "-e 's/.*Submitted batch job \\([0-9]\\+\\).*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) queued.*/\\1/p' " +
+                "-e 's/.*srun: job \\([0-9]\\+\\) has been allocated.*/\\1/p' " +
+                "-e 's/.*SLURM_JOB_ID=\\([0-9]\\+\\).*/\\1/p' " +
+                "-e 's/.*SLURM_JOBID=\\([0-9]\\+\\).*/\\1/p' " +
+                "${slurmOutputFile} | tail -n1 || true\""
+            ),
+            returnStdout: true
+        ).trim()
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
+        )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"rm -rf /home/svc_tensorrt/bloom/scripts/${jobUID} || true\""
+            )
+        )
+
+        if (!slurmJobID || !slurmJobID.isNumber()) {
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"cat ${slurmOutputFile} || true\""))
+            echo "Slurm job did not submit successfully. No job ID found."
+        } else {
+            // The original Slurm output file name is like "slurm-%j-*.out", we need to replace the %j with the real job ID.
+            def newSlurmOutputFile = slurmOutputFile.replace("%j", slurmJobID)
+            Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mv ${slurmOutputFile} ${newSlurmOutputFile} || true\""))
         }
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
-def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
+def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName, String slurmJobID) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def remote = [
             ip           : cluster.ip,
@@ -158,18 +212,35 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String nodeName){
             allowAnyHosts: true,
         ]
 
+        Utils.exec(pipeline, script: "echo Sleeping to allow docker stop; sleep 30")
+
+        CloudManager.destroyNode(nodeName)
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
+
         Utils.exec(pipeline, script: "apt-get update && apt-get install -y sshpass openssh-client")
-        pipeline.stage('Clean up SLURM Agent Resources') {
-            Utils.exec(
-                pipeline,
-                timeout: false,
-                script: Utils.sshUserCmd(
-                    remote,
-                    "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh"
-                )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"scancel ${slurmJobID} || true; sacct -j ${slurmJobID} --format=JobID,JobName%100,Partition%15,Account%15,State,ExitCode,NodeList%30 || true; scontrol show job ${slurmJobID} || true\""
             )
-            Utils.exec(pipeline, script: "echo done")
-        }
+        )
+
+        Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job termination; sleep 30")
+
+        Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(
+                remote,
+                "\"rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh || true\""
+            )
+        )
+
+        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
     }
 }
 
@@ -184,7 +255,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             sh """
                 ls -all ${stageName}/
                 if ! grep -q '<testcase' ${stageName}/results.xml; then
-                    rm ${stageName}/results.xml
+                    rm ${stageName}/results.xml || true
                 fi
             """
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
@@ -209,8 +280,13 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def nodeName = "${cluster.host}-test-${UUID.randomUUID().toString()}"
-    def nodeSecret = CloudManager.createNode(nodeName)
+    // Create a unique suffix for the node name and workspace
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def nodeName = "${cluster.host}-test-${customSuffix}"
+    def customWorkspace = "/tmp/${nodeName}"
+    def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
+
+    def slurmJobID = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -231,38 +307,121 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
 
                 Utils.exec(pipeline, script: "chmod +x ${jenkinsSetupPath}", returnStdout: true)
 
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${jenkinsSetupPath} ${remote.user}@${remote.host}:~/bloom/scripts/${nodeName}-slurm_jenkins_agent_setup.sh", numRetries: 3,)
 
-                Utils.exec(
+                Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
+
+                def slurmSubmitOutput = Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
-                            remote,
-                            """${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}"""
-                    )
+                        remote,
+                        "\"${SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl)}\""
+                    ),
+                    returnStdout: true
                 )
+
+                def jobIDs = slurmSubmitOutput
+                    .readLines()
+                    .collect { it.trim() }
+                    .collectMany { line ->
+                        def ids = []
+                        def m1 = (line =~ /Submitted batch job (\d+)/)
+                        if (m1) ids << m1[0][1]  // Extract the first captured group
+                        def m2 = (line =~ /srun: job (\d+) (queued|has been allocated)/)
+                        if (m2) ids << m2[0][1]  // Extract the first captured group
+                        def m3 = (line =~ /SLURM_JOB_ID=(\d+)/)
+                        if (m3) ids << m3[0][1]  // Extract the first captured group
+                        def m4 = (line =~ /SLURM_JOBID=(\d+)/)
+                        if (m4) ids << m4[0][1]  // Extract the first captured group
+                        return ids
+                    }
+
+                slurmJobID = jobIDs ? jobIDs[-1] : null
+
+                if (!slurmJobID || !slurmJobID.isNumber()) {
+                    echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
+                }
+                Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
                 Utils.exec(pipeline, script: "echo Sleeping to allow agent initialization; sleep 30")
             }
         }
 
         stage('Checking if the Node is Online') {
             def counter = 0
-            while (!CloudManager.isNodeOnline(nodeName) && counter < 12) {
-                sleep(time: 10, unit: 'MINUTES')  // Wait 10 minutes to check status of the node again
+            // We submit the Slurm job with 5 hours timeout, and the K8S pod will be evicted after 22 hours.
+            // Let's use 15 hours to check if the node is online, and with 2 hours buffer.
+            while (!CloudManager.isNodeOnline(nodeName) && counter < 90) {
+                // Wait 10 minutes to check status of the node again
+                sleep(time: 10, unit: 'MINUTES')
                 counter++
             }
 
             if (CloudManager.isNodeOnline(nodeName)) {
-                def dockerArgs = "--gpus ${gpuCount} --cap-add=SYS_ADMIN --ipc=host --security-opt seccomp=unconfined  -u root:root -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
-                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+                def dockerGPUOption = ""
+
+                node(nodeName) {
+                    sh """
+                        env | sort
+                        pwd && ls -alh
+                        ls -alh ${env.WORKSPACE}
+                        ls -alh ${env.WORKSPACE_TMP}
+                    """
+
+                    sh "nproc && free -g && hostname"
+                    echoNodeAndGpuInfo(pipeline, stageName)
+                    sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+                    // Use single quotes to avoid Jenkins variable expansion
+                    sh 'echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"'
+                    sh 'echo "NV_GPU: $NV_GPU"'
+
+                    // Dynamically set GPU arguments based on environment variables
+                    // https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/docker-specialized.html
+                    // It's intentional to check NV_GPU first.
+                    dockerGPUOption = sh(script: """
+                        if [ -n "\$NV_GPU" ]; then
+                            echo "--gpus '\\"device=\$NV_GPU\\"'"
+                        elif [ -n "\$CUDA_VISIBLE_DEVICES" ]; then
+                            echo "--gpus '\\"device=\$CUDA_VISIBLE_DEVICES\\"'"
+                        else
+                            echo "--gpus ${gpuCount}"
+                        fi
+                    """, returnStdout: true).trim()
+                }
+
+                def dockerArgs = "${dockerGPUOption} " +
+                    "--cap-add=SYS_ADMIN " +
+                    "--ipc=host " +
+                    "--security-opt seccomp=unconfined " +
+                    "-u root:root " +
+                    "-v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro " +
+                    "-v /tmp/ccache:${CCACHE_DIR}:rw " +
+                    "-v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw " +
+                    "--cap-add=SYSLOG"
+
+                echo "Final dockerArgs: ${dockerArgs}"
+
+                if (partition.clusterName == "dlcluster") {
+                    dockerArgs += " -e NVIDIA_IMEX_CHANNELS=0"
+                }
+
+                slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, true)
                 executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
             } else {
-                echo "The node does not come online in 2 hours, terminating the job"
+                error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
         }
     } finally {
-        cleanUpNodeResources(pipeline, cluster, nodeName)
-        CloudManager.destroyNode(nodeName)
+        stage("Clean up SLURM Resources") {
+            // Workaround to handle the interruption during clean up SLURM resources
+            retry(3) {
+                try {
+                    cleanUpNodeResources(pipeline, cluster, nodeName, slurmJobID)
+                } catch (Exception e) {
+                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                }
+            }
+        }
     }
 }
 
@@ -281,7 +440,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
     SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
-    def jobUID = "${cluster.host}-multi_node_test-${UUID.randomUUID().toString()}"
+    // Create a unique suffix for the job name
+    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
+
+    Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
+
+    def slurmOutputFile = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -307,14 +472,17 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
-            def scriptRunNode = "${jobWorkspace}/slurm_run.sh"
+            def scriptRunNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
+            def scriptLaunch = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            slurmOutputFile = SlurmConfig.getOutputFilePath("/home/svc_tensorrt/slurm-logs", jobUID)
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
+            def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def isAarch64 = config.contains("aarch64")
             def pytestTestTimeout = "7200"
 
             stage('Prepare Testing') {
                 // Create Job Workspace folder in Frontend Node
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh -oStrictHostKeyChecking=no ${remote.user}@${remote.host} 'mkdir ${jobWorkspace}'",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' ssh ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host} 'mkdir -p ${jobWorkspace}'", numRetries: 3,)
 
                 // Download and Unzip Tar File
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
@@ -323,7 +491,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // Upload slurm_run_sh to Frontend node
                 def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
                 Utils.exec(pipeline, script: "chmod +x ${scriptRunLocalPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}",)
+
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptRunLocalPath} ${remote.user}@${remote.host}:${scriptRunNode}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptRunLocalPath}")
+
+                // Upload waives.txt to Frontend node
+                def waivesListLocalPath = "${llmSrcLocal}/tests/integration/test_lists/waives.txt"
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${waivesListLocalPath} ${remote.user}@${remote.host}:${waivesListPathNode}", numRetries: 3,)
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
@@ -332,7 +506,7 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPath = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}", numRetries: 3,)
 
                 // Generate Multi Node Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
@@ -349,12 +523,13 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     "--container-image=${container}",
                     "--container-workdir=/home/svc_tensorrt/bloom/scripts",
                     "--container-mounts=${mounts}",
+                    "--container-env=NVIDIA_IMEX_CHANNELS"
                 ].join(" ")
 
-                def scriptLaunch = "/home/svc_tensorrt/bloom/scripts/${jobUID}/slurm_launch.sh"
                 def srunCmd = SlurmConfig.generateMultiNodeCommand(partition, taskArgs, scriptRunNode)
-                scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
+                def scriptLaunchDestPath = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
                 def scriptContent = """#!/bin/bash
+                    set -o pipefail
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
                     export llmTarfile=$llmTarfile
@@ -362,34 +537,49 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                     export stageName=$stageName
                     export testList=$testList
                     export testListPathNode=$testListPathNode
+                    export waivesListPathNode=$waivesListPathNode
                     export pytestTestTimeout=$pytestTestTimeout
                     export splits=$splits
                     export splitId=$splitId
                     export perfMode=$perfMode
                     export resourcePathNode=$resourcePathNode
                     export MODEL_CACHE_DIR=$MODEL_CACHE_DIR
+                    export NVIDIA_IMEX_CHANNELS=0
                     chmod +x ${scriptRunNode}
-                    ${srunCmd}
+                    ${srunCmd} 2>&1 | tee ${slurmOutputFile}
                 """.stripIndent()
                 pipeline.writeFile(file: scriptLaunchDestPath, text: scriptContent)
                 Utils.exec(pipeline, script: "chmod +x ${scriptLaunchDestPath}", returnStdout: true)
-                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}",)
+                Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p ${COMMON_SSH_OPTIONS} ${scriptLaunchDestPath} ${remote.user}@${remote.host}:${scriptLaunch}", numRetries: 3,)
+                Utils.exec(pipeline, script: "cat ${scriptLaunchDestPath}")
             }
+
             stage('Run Test') {
-                def scriptLaunch = "${jobWorkspace}/slurm_launch.sh"
                 Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
-                        """bash ${scriptLaunch}"""
+                        "\"bash ${scriptLaunch}\""
                     )
                 )
             }
+
+            echo "Finished test stage execution."
         }
     } finally {
         uploadResults(pipeline, cluster, jobUID, stageName)
-        cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID)
+
+        stage("Clean up SLURM Resources") {
+            // Workaround to handle the interruption during clean up SLURM resources
+            retry(3) {
+                try {
+                    cleanUpNodeResourcesMultiNodes(pipeline, cluster, jobUID, slurmOutputFile)
+                } catch (Exception e) {
+                    error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                }
+            }
+        }
     }
 }
 
@@ -429,7 +619,7 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
@@ -449,7 +639,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): false,
     (EXTRA_STAGE_LIST): null,
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): false,
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
@@ -461,10 +651,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 String getShortenedJobName(String path)
@@ -477,6 +670,7 @@ String getShortenedJobName(String path)
         "L1_Custom": "l1-cus",
         "L1_Nightly": "l1-nt",
         "L1_Stable": "l1-stb",
+        "BuildDockerImageSanityTest": "img-check",
     ]
     def parts = path.split('/')
     // Apply nameMapping to the last part (jobName)
@@ -512,8 +706,16 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
-            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg; fi'
+            sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
             if (noResultIfSuccess && !stageIsFailed) {
+                // Clean up the workspace
+                sh """
+                    env | sort
+                    pwd && ls -alh
+                    rm -rf ./*
+                """
+
+                echo "Finished test stage execution."
                 return
             }
             echo "noResultIfSuccess: ${noResultIfSuccess}, stageIsFailed: ${stageIsFailed}"
@@ -535,6 +737,15 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             )
             junit(testResults: "${stageName}/results*.xml")
         }
+
+        // Clean up the workspace
+        sh """
+            env | sort
+            pwd && ls -alh
+            rm -rf ./*
+        """
+
+        echo "Finished test stage execution."
     }
 }
 
@@ -577,7 +788,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_SLURM}]
                     tty: true
                     resources:
                       requests:
@@ -595,7 +806,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TMP}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_BUILD}]
                     volumeMounts:
                     - name: sw-tensorrt-pvc
                       mountPath: "/mnt/sw-tensorrt-pvc"
@@ -617,11 +828,10 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
         def storageSize = "300Gi"
-        def driverVersion = Constants.DEFAULT_NVIDIA_DRIVER_VERSION
+        def driverVersion = REQUIRED_OPEN_DRIVER_TYPES.any { type.contains(it) } ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
-        // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
-        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
+        if (hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
@@ -635,7 +845,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         targetCould = "kubernetes"
 
         // The following GPU types doesn't support dynamic driver flashing.
-        if (type.contains("dgx-h100") || type.contains("dgx-h200") || type in ["b100-ts2", "gh200", "rtx-5080", "rtx-5090"]) {
+        if (REQUIRED_NO_DRIVER_TYPES.any { type.contains(it) }) {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -662,7 +872,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         containerConfig = """
                   - name: trt-llm
                     image: ${image}
-                    command: ['sleep', ${POD_TIMEOUT_SECONDS}]
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
                     tty: true
                     resources:
                       requests:
@@ -764,14 +974,21 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
 
 def echoNodeAndGpuInfo(pipeline, stageName)
 {
-    String hostNodeName = sh(script: 'echo $HOST_NODE_NAME', returnStdout: true)
+    String hostNodeName = sh(script: '''
+        if [ -n "$HOST_NODE_NAME" ]; then
+            echo "$HOST_NODE_NAME"
+        else
+            hostname -f || hostname
+        fi
+    ''', returnStdout: true).trim()
+
     String gpuUuids = pipeline.sh(script: "nvidia-smi -q | grep \"GPU UUID\" | awk '{print \$4}' | tr '\n' ',' || true", returnStdout: true)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
 def runLLMDocBuild(pipeline, config)
 {
-    // Step 1: cloning tekit source code
+    // Step 1: cloning source code
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
@@ -838,7 +1055,7 @@ def launchTestListCheck(pipeline)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: """apt-get update && apt-get install \
             libffi-dev \
             -y""")
-            sh "nvidia-smi -q"
+            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
             // download TRT-LLM tarfile
             def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
@@ -1065,7 +1282,7 @@ def getSSHConnectionPorts(portConfigFile, stageName)
         usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
         string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
         ]) {
-        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'netstat -tuln'",returnStdout: true)
+        portUsage = sh(script: "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'netstat -tuln'", returnStdout: true)
     }
     echo "Port Usage: ${portUsage}"
 
@@ -1108,7 +1325,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${WORKSPACE}/${stageName}/ \
         --input-file=${WORKSPACE}/${stageName}/results.xml \
@@ -1117,7 +1334,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // If there are some failed tests that cannot be rerun (e.g. test duration > 10 min and no known failure signatures),
     // fail the stage immediately without attempting any reruns
-    rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
+    def rerunTestList = "${WORKSPACE}/${stageName}/rerun_0.txt"
     if (fileExists(rerunTestList)) {
         sh "cat ${rerunTestList}"
         error "There are some failed tests that cannot be rerun, skip the rerun step."
@@ -1126,10 +1343,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // If the stage has more than 5 failed tests, skip the rerun step
     def validLineCount = 0
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (fileExists(currentRerunTestList)) {
             count = sh(
-                script: "grep -v '^[[:space:]]*\$' ${rerunTestList} | wc -l",
+                script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
             echo "Found ${count} tests to rerun ${times} time(s)"
@@ -1143,23 +1360,23 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     }
 
     // Rerun tests
-    isRerunFailed = false
+    def isRerunFailed = false
     for (times in [1, 2]) {
-        rerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
-        if (!fileExists(rerunTestList)) {
+        def currentRerunTestList = "${WORKSPACE}/${stageName}/rerun_${times}.txt"
+        if (!fileExists(currentRerunTestList)) {
             echo "No failed tests need to be rerun ${times} time(s)"
             continue
         }
-        sh "cat ${rerunTestList}"
-        xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
+        sh "cat ${currentRerunTestList}"
+        def xmlFile = "${WORKSPACE}/${stageName}/rerun_results_${times}.xml"
         // change the testCmdLine for rerun
-        noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
-        needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
-        testCmdLine = testCmdLine.findAll { cmd ->
+        def noNeedLine = ["--splitting-algorithm", "--splits", "--group", "--waives-file", "--cov"]
+        def needToChangeLine = ["--test-list", "--csv", "--junit-xml"]
+        def newTestCmdLine = testCmdLine.findAll { cmd ->
             !noNeedLine.any { line -> cmd.contains(line) } && !needToChangeLine.any { line -> cmd.contains(line) }
         }
-        testCmdLine += [
-            "--test-list=${rerunTestList}",
+        newTestCmdLine += [
+            "--test-list=${currentRerunTestList}",
             "--csv=${WORKSPACE}/${stageName}/rerun_report_${times}.csv",
             "--junit-xml ${xmlFile}",
             "--reruns ${times - 1}"
@@ -1167,7 +1384,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         try {
             sh """
                 cd ${llmSrc}/tests/integration/defs && \
-                ${testCmdLine.join(" ")}
+                ${newTestCmdLine.join(" ")}
             """
         } catch(InterruptedException e) {
             throw e
@@ -1181,12 +1398,15 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
         }
     }
 
-    // generate rerun report
-    inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_1.xml",
-                  "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
+    // Specify the stage name correctly
+    sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' *.xml || true"
+
+    // Generate rerun report
+    def inputFiles = ["${WORKSPACE}/${stageName}/results.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_1.xml",
+                      "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
         --input-files=${inputFiles.join(",")}
@@ -1194,7 +1414,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // Update original results xml file with rerun results xml files for junit
     sh """
-        python3 ${llmSrc}/tests/integration/defs/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         merge_junit_xmls \
         --output-file=${WORKSPACE}/${stageName}/results.xml \
         --input-files=${inputFiles.join(",")} \
@@ -1213,15 +1433,18 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
 def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312")
 {
-    // Step 1: create LLM_ROOT dir
-    sh "pwd && ls -alh"
-    // TODO: proper way to clean workspace, maybe save in a folder named with BUILD_ID.
-    // So that it can work with multiple job running in same node
-    sh "rm -rf ./*"
+    // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
-    sh "mkdir ${llmRootConfig}"
+    sh """
+        env | sort
+        pwd && ls -alh
+        rm -rf ./*
+        mkdir ${llmRootConfig}
+        ls -alh ${env.WORKSPACE}
+        ls -alh ${env.WORKSPACE_TMP}
+    """
 
-    def llmPath = sh (script: "realpath ${llmRootConfig}",returnStdout: true).trim()
+    def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
     echoNodeAndGpuInfo(pipeline, stageName)
 
@@ -1240,7 +1463,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
-        sh "nvidia-smi -q"
+        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
@@ -1262,6 +1485,22 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
+
+        // Download the new merged waives.txt
+        def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
+        try {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+            if (!fileExists("waives.txt")) {
+                error "There is no merged waives.txt file, use the default waives.txt."
+            }
+            sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+            sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+            echo "Download merged waives.txt successfully"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
+        }
 
         // install python package
         if (env.alternativeTRT) {
@@ -1319,9 +1558,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 usernamePassword(credentialsId: 'tensorrt_llm_infra_debug_vm_01_credentials', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD'),
                 string(credentialsId: 'DEBUG_HOST_NAME', variable: 'HOST_NAME')
                 ]) {
-                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
-                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
-                sh "ssh -v ${USERNAME}@${HOST_NAME} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
+                sh "sshpass -p ${PASSWORD} -v ssh ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'cat >> ~/.ssh/authorized_keys' < ~/.ssh/id_rsa.pub"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'echo \"\" > ~/.ssh/known_hosts && cat ~/.ssh/id_rsa.pub' >> ~/.ssh/authorized_keys"
+                sh "ssh -v ${USERNAME}@${HOST_NAME} ${COMMON_SSH_OPTIONS} 'cat ~/.ssh/ports_config.txt' >> ${portConfigFilePath}"
 
                 def (int userPort, int monitorPort) = getSSHConnectionPorts(portConfigFilePath, stageName)
                 if (userPort == 0) {
@@ -1330,7 +1569,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     return
                 }
 
-                sh "ssh -f -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
+                sh "ssh -f ${COMMON_SSH_OPTIONS} -L 1111:127.0.0.1:${monitorPort} -R ${monitorPort}:127.0.0.1:1112 -NR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
                 sh "autossh -fNR ${userPort}:localhost:22 ${USERNAME}@${HOST_NAME}"
                 sh "ps aux | grep ssh"
                 try {
@@ -1355,10 +1594,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     stage ("[${stageName}] Run Pytest")
     {
         echoNodeAndGpuInfo(pipeline, stageName)
-        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C; fi'
+        sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
         def extraInternalEnv = ""
-        def pytestTestTimeout = "1800"
+        def pytestTestTimeout = "3600"
 
         // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
         extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -1445,7 +1684,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception e) {
-                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
+                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
                     if (isRerunFailed) {
                         error "The tests still failed after rerun attempt."
                     }
@@ -1559,7 +1798,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -1600,7 +1839,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     sh "nproc && free -g && hostname"
     sh "bash -c 'pip3 show tensorrt || true'"
     sh "cat ${MODEL_CACHE_DIR}/README"
-    sh "nvidia-smi -q"
+    sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
 
     sh "pwd && ls -alh"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
@@ -1639,7 +1878,8 @@ def checkStageNameSet(stageNames, jobKeys, paramName) {
     echo "Validate stage names for the passed GitLab bot params [${paramName}]."
     invalidStageName = stageNames.findAll { !(it in jobKeys) }
     if (invalidStageName) {
-        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}].")
+        def sortedJobKeys = jobKeys.sort()
+        throw new Exception("Cannot find the stage names [${invalidStageName}] from the passed params [${paramName}]. Available stage names (${sortedJobKeys.size()} total):\n${sortedJobKeys.collect { "    ${it}" }.join('\n')}")
     }
 }
 
@@ -1650,32 +1890,25 @@ def checkStageName(stageNames) {
     }
 }
 
-// TODO: Update existing functions to use runInDockerOnNodeMultiStage and get rid of runInDockerOnNode
 def runInDockerOnNodeMultiStage(image, label, dockerArgs, needToDeleteDir=true)
 {
     return {
         runner -> node(label) {
-            if (needToDeleteDir) {
-                deleteDir()
-            }
-            stage('Pull Docker Image') {
-                docker.image(image).pull()
-            }
-            docker.image(image).inside(dockerArgs) {
-                runner()
-            }
-        }
-    }
-}
-
-def runInDockerOnNode(image, label, dockerArgs)
-{
-    return {
-        stageName, runner -> stage(stageName) {
-            node(label) {
-                deleteDir()
+            try {
+                if (needToDeleteDir) {
+                    deleteDir()
+                }
+                stage('Pull Docker Image') {
+                    docker.image(image).pull()
+                }
                 docker.image(image).inside(dockerArgs) {
                     runner()
+                }
+            } catch (Exception e) {
+                if (e.getMessage()?.contains("Failed to kill container")) {
+                    echo "Known benign error ignored: ${e.getMessage()}"
+                } else {
+                    throw e // Re-throw if it's a different IOException
                 }
             }
         }
@@ -1694,9 +1927,25 @@ def runInKubernetes(pipeline, podSpec, containerName)
     }
 }
 
-def launchTestJobs(pipeline, testFilter, dockerNode=null)
+def launchTestJobs(pipeline, testFilter)
 {
-    def dockerArgs = "-v /mnt/scratch.trt_llm_data:/scratch.trt_llm_data:ro -v /tmp/ccache:${CCACHE_DIR}:rw -v /tmp/pipcache/http-v2:/root/.cache/pip/http-v2:rw --cap-add syslog"
+    // IMPORTANT: Stage Configuration Syntax Requirement
+    //
+    // The test_to_stage_mapping.py script expects stage definitions in the following format:
+    // "Stage-Name": ["platform", "yaml_file", split_id, split_count, gpu_count]
+    //
+    // Where:
+    // - Stage-Name: Must be quoted string, used to identify the Jenkins stage
+    // - platform: Hardware platform identifier (e.g., "a10", "h100-cr")
+    // - yaml_file: Test database YAML filename without .yml extension (e.g., "l0_a10")
+    // - split_id: Current split number (1-based)
+    // - split_count: Total number of splits
+    // - gpu_count: Number of GPUs required (optional, defaults to 1)
+    //
+    // This format is parsed by scripts/test_to_stage_mapping.py to provide bidirectional
+    // mapping between test names and Jenkins stage names. Any changes to this syntax
+    // may break the mapping functionality.
+
     x86TestConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
@@ -1710,6 +1959,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
+        "A10-Pybind": ["a10", "l0_a10_pybind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1726,55 +1976,60 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "H100_PCIe-CPP-2": ["h100-cr", "l0_h100", 2, 2],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 2],
         "H100_PCIe-TensorRT-2": ["h100-cr", "l0_h100", 2, 2],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
-        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
-        "B200_PCIe-TensorRT-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-TensorRT-2": ["b100-ts2", "l0_b200", 2, 2],
+        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 2],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
-        "A10-TensorRT-[Post-Merge]-1": ["a10", "l0_a10", 1, 2],
-        "A10-TensorRT-[Post-Merge]-2": ["a10", "l0_a10", 2, 2],
-        "A30-TensorRT-[Post-Merge]-1": ["a30", "l0_a30", 1, 6],
-        "A30-TensorRT-[Post-Merge]-2": ["a30", "l0_a30", 2, 6],
-        "A30-TensorRT-[Post-Merge]-3": ["a30", "l0_a30", 3, 6],
-        "A30-TensorRT-[Post-Merge]-4": ["a30", "l0_a30", 4, 6],
-        "A30-TensorRT-[Post-Merge]-5": ["a30", "l0_a30", 5, 6],
-        "A30-TensorRT-[Post-Merge]-6": ["a30", "l0_a30", 6, 6],
-        "A30-CPP-[Post-Merge]-1": ["a30", "l0_a30", 1, 1],
-        "A30-Triton-[Post-Merge]-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-[Post-Merge]-2": ["a30", "l0_a30", 2, 2],
-        "A100X-TensorRT-[Post-Merge]-1": ["a100x", "l0_a100", 1, 6],
-        "A100X-TensorRT-[Post-Merge]-2": ["a100x", "l0_a100", 2, 6],
-        "A100X-TensorRT-[Post-Merge]-3": ["a100x", "l0_a100", 3, 6],
-        "A100X-TensorRT-[Post-Merge]-4": ["a100x", "l0_a100", 4, 6],
-        "A100X-TensorRT-[Post-Merge]-5": ["a100x", "l0_a100", 5, 6],
-        "A100X-TensorRT-[Post-Merge]-6": ["a100x", "l0_a100", 6, 6],
-        "A100X-Triton-[Post-Merge]-1": ["a100x", "l0_a100", 1, 2],
-        "A100X-Triton-[Post-Merge]-2": ["a100x", "l0_a100", 2, 2],
-        "L40S-TensorRT-[Post-Merge]-1": ["l40s", "l0_l40s", 1, 5],
-        "L40S-TensorRT-[Post-Merge]-2": ["l40s", "l0_l40s", 2, 5],
-        "L40S-TensorRT-[Post-Merge]-3": ["l40s", "l0_l40s", 3, 5],
-        "L40S-TensorRT-[Post-Merge]-4": ["l40s", "l0_l40s", 4, 5],
-        "L40S-TensorRT-[Post-Merge]-5": ["l40s", "l0_l40s", 5, 5],
-        "H100_PCIe-PyTorch-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-CPP-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-TensorRT-[Post-Merge]-1": ["h100-cr", "l0_h100", 1, 5],
-        "H100_PCIe-TensorRT-[Post-Merge]-2": ["h100-cr", "l0_h100", 2, 5],
-        "H100_PCIe-TensorRT-[Post-Merge]-3": ["h100-cr", "l0_h100", 3, 5],
-        "H100_PCIe-TensorRT-[Post-Merge]-4": ["h100-cr", "l0_h100", 4, 5],
-        "H100_PCIe-TensorRT-[Post-Merge]-5": ["h100-cr", "l0_h100", 5, 5],
-        "B200_PCIe-Triton-[Post-Merge]-1": ["b100-ts2", "l0_b200", 1, 1],
+        "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
+        "A10-TensorRT-Post-Merge-1": ["a10", "l0_a10", 1, 2],
+        "A10-TensorRT-Post-Merge-2": ["a10", "l0_a10", 2, 2],
+        "A30-TensorRT-Post-Merge-1": ["a30", "l0_a30", 1, 6],
+        "A30-TensorRT-Post-Merge-2": ["a30", "l0_a30", 2, 6],
+        "A30-TensorRT-Post-Merge-3": ["a30", "l0_a30", 3, 6],
+        "A30-TensorRT-Post-Merge-4": ["a30", "l0_a30", 4, 6],
+        "A30-TensorRT-Post-Merge-5": ["a30", "l0_a30", 5, 6],
+        "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
+        "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 1],
+        "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
+        "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
+        "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
+        "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
+        "A100X-TensorRT-Post-Merge-4": ["a100x", "l0_a100", 4, 6],
+        "A100X-TensorRT-Post-Merge-5": ["a100x", "l0_a100", 5, 6],
+        "A100X-TensorRT-Post-Merge-6": ["a100x", "l0_a100", 6, 6],
+        "A100X-Triton-Post-Merge-1": ["a100x", "l0_a100", 1, 2],
+        "A100X-Triton-Post-Merge-2": ["a100x", "l0_a100", 2, 2],
+        "L40S-TensorRT-Post-Merge-1": ["l40s", "l0_l40s", 1, 5],
+        "L40S-TensorRT-Post-Merge-2": ["l40s", "l0_l40s", 2, 5],
+        "L40S-TensorRT-Post-Merge-3": ["l40s", "l0_l40s", 3, 5],
+        "L40S-TensorRT-Post-Merge-4": ["l40s", "l0_l40s", 4, 5],
+        "L40S-TensorRT-Post-Merge-5": ["l40s", "l0_l40s", 5, 5],
+        "H100_PCIe-PyTorch-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-CPP-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
+        "H100_PCIe-TensorRT-Post-Merge-1": ["h100-cr", "l0_h100", 1, 5],
+        "H100_PCIe-TensorRT-Post-Merge-2": ["h100-cr", "l0_h100", 2, 5],
+        "H100_PCIe-TensorRT-Post-Merge-3": ["h100-cr", "l0_h100", 3, 5],
+        "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
+        "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
+        "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
+        "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
+        "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
-        "DGX_H200-8_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
-        "DGX_H200-4_GPUs-PyTorch-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
-        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
-        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
-        "DGX_H200-4_GPUs-TensorRT-[Post-Merge]-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
+        "DGX_H200-4_GPUs-Triton-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
+        "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
+        "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
+        "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
+        "RTXPro6000-Pytorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
+        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000-4_GPUs-Pytorch-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
@@ -1785,13 +2040,18 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
+        if (key.contains("Pybind")) {
+            config = PYBIND_CONFIG
+        }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
     fullSet = parallelJobs.keySet()
 
     x86SlurmTestConfigs = [
-        "RTXPro6000-PyTorch-[Post-Merge]-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-[Post-Merge]-1": ["b200-4-gpus", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-1": ["b200-x4", "l0_dgx_b200", 1, 2, 4],
+        "DGX_B200-4_GPUs-PyTorch-2": ["b200-x4", "l0_dgx_b200", 2, 2, 4],
+        "DGX_B200-8_GPUs-PyTorch-1": ["b200-x8", "l0_dgx_b200", 1, 1, 8],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -1811,18 +2071,28 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     // Try to match what are being tested on x86 H100_PCIe.
     // The total machine time is scaled proportionally according to the number of each GPU.
     SBSATestConfigs = [
-        "GH200-TensorRT-[Post-Merge]-1": ["gh200", "l0_gh200", 1, 2],
-        "GH200-TensorRT-[Post-Merge]-2": ["gh200", "l0_gh200", 2, 2],
+        "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
     ]
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-[Post-Merge]-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
+        "GB200-PyTorch-1": ["gb200-single", "l0_gb200", 1, 1],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        "GB200-8_GPUs-2_Nodes-PyTorch-[Post-Merge]-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 1, 8, 2],
+        // Each stage test 1 testcase with 8 GPUs and 2 nodes.
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 5, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 5, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -1880,7 +2150,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     }]]}
 
     // Python version and OS for sanity check
-    sanityCheckConfigs = [
+    x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
             "B200_PCIe",
@@ -1910,31 +2180,35 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         ],
     ]
 
-    if (env.targetArch == AARCH64_TRIPLE) {
-        sanityCheckConfigs = [
-            "PY312-UB2404": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "",
-                UBUNTU_24_04_IMAGE,
-                true, // Extra PyTorch CUDA 12.8 install
-            ],
-            "PY312-DLFW": [
-                LLM_DOCKER_IMAGE,
-                "GH200",
-                AARCH64_TRIPLE,
-                false,
-                "dlfw/",
-                DLFW_IMAGE,
-                false,
-            ],
-        ]
-    }
+    aarch64SanityCheckConfigs = [
+        "PY312-UB2404": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "",
+            UBUNTU_24_04_IMAGE,
+            true, // Extra PyTorch CUDA 12.8 install
+        ],
+        "PY312-DLFW": [
+            LLM_DOCKER_IMAGE,
+            "GH200",
+            AARCH64_TRIPLE,
+            false,
+            "dlfw/",
+            DLFW_IMAGE,
+            false,
+        ],
+    ]
 
     def toStageName = { gpuType, key -> "${gpuType}-PackageSanityCheck-${key}".toString() }
-    fullSet += sanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += x86SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+    fullSet += aarch64SanityCheckConfigs.collectEntries{ key, values -> [toStageName(values[1], key), null] }.keySet()
+
+    sanityCheckConfigs = x86SanityCheckConfigs
+    if (env.targetArch == AARCH64_TRIPLE) {
+        sanityCheckConfigs = aarch64SanityCheckConfigs
+    }
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
         cacheErrorAndUploadResult(toStageName(values[1], key), {
@@ -1956,12 +2230,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             def buildRunner = runInKubernetes(pipeline, buildSpec, "trt-llm")
             def sanityRunner = null
 
-            if (dockerNode) {
-                sanityRunner = runInDockerOnNode(values[0], dockerNode, dockerArgs)
-            } else {
-                def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
-                sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
-            }
+
+            def sanitySpec = createKubernetesPodConfig(values[0], gpu_type, k8s_arch)
+            sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
             def wheelPath = "${values[4]}"
             def wheelName = ""
@@ -2001,18 +2272,27 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     trtllm_utils.launchKubernetesPod(pipeline, pipInstallSanitySpec, "trt-llm", {
                         echo "###### Prerequisites Start ######"
+                        echoNodeAndGpuInfo(pipeline, toStageName(values[1], key))
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl")
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
+                        if (values[5] != DLFW_IMAGE) {
+                            def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
+                            def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
+                        }
 
-                        // Extra PyTorch CUDA 12.8 install
+                        // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
@@ -2028,8 +2308,13 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
+                            // Retry 2 times if timeout occurs.
                             sh "env | sort"
-                            checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                            trtllm_utils.llmRetry(1, "checkPipInstall", {
+                                timeout(time: 30, unit: 'MINUTES') {
+                                    checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
+                                }
+                            })
                         }
                         echo "###### Run LLMAPI tests Start ######"
                         def config = VANILLA_CONFIG
@@ -2038,7 +2323,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, "${values[1]}-${key}-sanity-check" , 1, 1, true, null)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null)
                         }
                     })
                 }
@@ -2048,6 +2333,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     multiGpuJobs = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && !it.key.contains("Post-Merge")}
     println multiGpuJobs.keySet()
+    multiGpuJobsPostMerge = parallelJobs.findAll{(it.key.contains("4_GPUs") || it.key.contains("8_GPUs")) && it.key.contains("Post-Merge")}
 
     parallelJobs += docBuildJobs
     parallelJobs += sanityCheckJobs
@@ -2062,7 +2348,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         parallelJobsFiltered += multiGpuJobs
     }
 
-    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
         echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
         def autoTriggerTagStages = [:]
         for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
@@ -2095,7 +2381,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     // Check --only-multi-gpu-test, if true, only run multi-GPU test stages.
     if (testFilter[(ONLY_MULTI_GPU_TEST)]) {
-        parallelJobsFiltered = multiGpuJobs
+        if (testFilter[(IS_POST_MERGE)]) {
+            parallelJobsFiltered = multiGpuJobsPostMerge
+        } else {
+            parallelJobsFiltered = multiGpuJobs
+        }
     }
 
     // Check --disable-multi-gpu-test, if true, remove multi-GPU test stages.
@@ -2131,12 +2421,24 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         println parallelJobsFiltered.keySet()
     }
 
-    if (testFilter[(ONLY_PYTORCH_FILE_CHANGED)]) {
+    if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+        echo "Only docs files are changed, run doc build stage only."
+        parallelJobsFiltered = docBuildJobs
+        println parallelJobsFiltered.keySet()
+    } else if (testFilter[(ONLY_ONE_GROUP_CHANGED)] != "") {
         if (testFilter[(TEST_BACKEND)] != null) {
-            echo "Force disable ONLY_PYTORCH_FILE_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
+            echo "Force disable ONLY_ONE_GROUP_CHANGED mode. Backend mode set by flag: ${testFilter[(TEST_BACKEND)]}."
         } else {
-            echo "ONLY_PYTORCH_FILE_CHANGED mode is true."
-            parallelJobsFiltered = parallelJobsFiltered.findAll { !it.key.contains("-CPP-") && !it.key.contains("-TensorRT-") }
+            echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
+            def excludedBackends = new HashMap()
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-"]
+            excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-"]
+            def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
+            if (excludedBackends.containsKey(group)) {
+                parallelJobsFiltered = parallelJobsFiltered.findAll { key, value ->
+                    !excludedBackends[group].any { backend -> key.contains(backend) }
+                }
+            }
             println parallelJobsFiltered.keySet()
         }
     }
@@ -2174,17 +2476,10 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 stage("Skip - reused") {
                     echo "Skip - Passed in the last pipeline."
                 }
-            } else if (values instanceof List && dockerNode == null) {
+            } else if (values instanceof List) {
                 trtllm_utils.launchKubernetesPod(pipeline, values[0], "trt-llm", {
                     values[1]()
                 })
-            } else if (values instanceof List && dockerNode != null) {
-                node(dockerNode) {
-                    deleteDir()
-                    docker.image(LLM_DOCKER_IMAGE).inside(dockerArgs) {
-                        values[1]()
-                    }
-                }
             } else {
                 values()
             }
@@ -2193,6 +2488,90 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     return parallelJobsFiltered
 }
+
+
+
+def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
+    def testConfigs = [
+        "NGC Devel Image amd64": [
+            name: "NGC-Devel-Image-amd64-Sanity-Test",
+            k8sArch: "amd64",
+            wheelInstalled: false,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Devel Image arm64": [
+            name: "NGC-Devel-Image-arm64-Sanity-Test",
+            k8sArch: "arm64",
+            wheelInstalled: false,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+        "NGC Release Image amd64": [
+            name: "NGC-Release-Image-amd64-Sanity-Test-A10",
+            gpuType: "a10",
+            k8sArch: "amd64",
+            wheelInstalled: true,
+            config: VANILLA_CONFIG,
+        ],
+        "NGC Release Image arm64": [
+            name: "NGC-Release-Image-arm64-Sanity-Test-GH200",
+            gpuType: "gh200",
+            k8sArch: "arm64",
+            wheelInstalled: true,
+            config: LINUX_AARCH64_CONFIG,
+        ],
+    ]
+    if (!ENABLE_NGC_DEVEL_IMAGE_TEST) {
+        ["NGC Devel Image amd64", "NGC Devel Image arm64"].each { key ->
+            testConfigs.remove(key)
+        }
+        echo "NGC Devel Image test is disabled."
+    }
+    if (!ENABLE_NGC_RELEASE_IMAGE_TEST) {
+        ["NGC Release Image amd64", "NGC Release Image arm64"].each { key ->
+            testConfigs.remove(key)
+        }
+        echo "NGC Release Image test is disabled."
+    }
+    // Update testConfigs image field using the map from globalVars
+    testConfigs.each { key, config ->
+        if (globalVars[IMAGE_KEY_TO_TAG] && globalVars[IMAGE_KEY_TO_TAG][key]) {
+            config.image = globalVars[IMAGE_KEY_TO_TAG][key]
+        }
+    }
+    // Filter out all configs that don't have image set
+    testConfigs = testConfigs.findAll { key, config ->
+        return config.image != null
+    }
+
+    echo "Filtered test configs with images:"
+    println testConfigs
+
+    def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
+        if (values.wheelInstalled) {
+            stage(values.name) {
+                echo "Run ${values.name} sanity test."
+                imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name , 1, 1, true, null)
+                })
+            }
+        } else {
+            stage(values.name) {
+                imageSanitySpec = createKubernetesPodConfig(values.image, "build", values.k8sArch)
+                trtllm_utils.launchKubernetesPod(pipeline, imageSanitySpec, "trt-llm", {
+                    sh "env | sort"
+                    def cpuArch = values.k8sArch == "amd64" ? X86_64_TRIPLE : AARCH64_TRIPLE
+                    runLLMBuild(pipeline, cpuArch, false, "imageTest/")
+                })
+            }
+        }
+    }]}
+
+    return testJobs
+}
+
 
 pipeline {
     agent {
@@ -2210,6 +2589,7 @@ pipeline {
         //Workspace normally is: /home/jenkins/agent/workspace/LLM/L0_MergeRequest@tmp/
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
+        GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
@@ -2234,7 +2614,11 @@ pipeline {
         {
             when {
                 expression {
-                    env.targetArch == X86_64_TRIPLE  // Only execute the check if running on x86
+                    // Only run the test list validation when necessary
+                    env.targetArch == X86_64_TRIPLE &&
+                    testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
+                    !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
+                    !(env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/)
                 }
             }
             steps
@@ -2247,29 +2631,64 @@ pipeline {
         stage("Test") {
             steps {
                 script {
-                    parallelJobs = launchTestJobs(this, testFilter)
+                    if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
+                        parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
+                    } else {
+                        parallelJobs = launchTestJobs(this, testFilter)
+                    }
 
                     singleGpuJobs = parallelJobs
                     dgxJobs = [:]
 
                     def testPhase2StageName = env.testPhase2StageName
                     if (testPhase2StageName) {
-                        def dgxSigns = ["DGX_H100", "DGX_H200", "GB200", "DGX_B200"]
+                        def dgxSigns = ["2_GPUs", "4_GPUs", "8_GPUs"]
                         singleGpuJobs = parallelJobs.findAll{!dgxSigns.any{sign -> it.key.contains(sign)}}
                         dgxJobs = parallelJobs.findAll{dgxSigns.any{sign -> it.key.contains(sign)}}
                     }
 
-                    if (singleGpuJobs.size() > 0) {
-                        singleGpuJobs.failFast = params.enableFailFast
-                        parallel singleGpuJobs
-                    } else {
-                        echo "Skip single-GPU testing. No test to run."
-                    }
-
-                    if (dgxJobs.size() > 0) {
-                        stage(testPhase2StageName) {
+                    if (env.JOB_NAME ==~ /.*Single-GPU.*/) {
+                        echo "Only run single-GPU tests."
+                        if (dgxJobs.size() > 0) {
+                            if (globalVars[ACTION_INFO]['parents'].size() > 0) {
+                                // We add a special marker to the parent job's description.
+                                // This will be used to decide whether to run multi-GPU test stage.
+                                def parentJob = globalVars[ACTION_INFO]['parents'][-2]
+                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
+                            } else {
+                                echo "No parent job found to add the special marker for executing multi-GPU test stage."
+                            }
+                        } else {
+                            echo "Skip multi-GPU testing. No test to run."
+                        }
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+                    } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
+                        echo "Only run multi-GPU tests."
+                        if (dgxJobs.size() > 0) {
                             dgxJobs.failFast = params.enableFailFast
                             parallel dgxJobs
+                        } else {
+                            error "Skip multi-GPU testing. No test to run."
+                        }
+                    } else {
+                        if (singleGpuJobs.size() > 0) {
+                            singleGpuJobs.failFast = params.enableFailFast
+                            parallel singleGpuJobs
+                        } else {
+                            echo "Skip single-GPU testing. No test to run."
+                        }
+
+                        if (dgxJobs.size() > 0) {
+                            stage(testPhase2StageName) {
+                                dgxJobs.failFast = params.enableFailFast
+                                parallel dgxJobs
+                            }
                         }
                     }
                 }

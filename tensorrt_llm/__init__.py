@@ -29,7 +29,13 @@ _add_trt_llm_dll_directory()
 
 import sys
 
+# Need to import xgrammar before tensorrt_llm library,
+# otherwise `MemoryError: std::bad_alloc` pattern error will be raised.
+import xgrammar  # noqa
+
+import tensorrt_llm._torch.models as torch_models
 import tensorrt_llm.functional as functional
+import tensorrt_llm.math_utils as math_utils
 import tensorrt_llm.models as models
 import tensorrt_llm.quantization as quantization
 import tensorrt_llm.runtime as runtime
@@ -45,7 +51,7 @@ from .auto_parallel import AutoParallelConfig, auto_parallel
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, LlmArgs
+from .llmapi import LLM, MultimodalEncoder
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -77,6 +83,7 @@ __all__ = [
     'default_trtnet',
     'precision',
     'net_guard',
+    'torch_models',
     'Network',
     'Mapping',
     'MnnvlMemory',
@@ -98,12 +105,14 @@ __all__ = [
     'quantization',
     'tools',
     'LLM',
+    'MultimodalEncoder',
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
     'SamplingParams',
     'DisaggregatedParams',
     'KvCacheConfig',
+    'math_utils',
     '__version__',
 ]
 

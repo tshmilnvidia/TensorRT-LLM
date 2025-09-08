@@ -102,9 +102,9 @@ public:
         int headDimPerCtaV, int headDimQk, int headDimV, int tileSizeKv, int numTokensPerPage,
         int maxNumHeadsQPerKvInCta, bool reuseSmemKForV, bool uses2CtaMma) const
     {
-        TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 2048)
-                && (headDimQk <= 2048) && (headDimV <= 2048) && (numTokensPerPage <= 128),
-            "Expect (32 <= headDim <= 2048) && (numTokensPerPage <= 128), got headDimPerCtaV=%d, headDimQk=%d, "
+        TLLM_CHECK_WITH_INFO((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) && (headDimPerCtaV <= 1024)
+                && (headDimQk <= 1024) && (headDimV <= 1024) && (numTokensPerPage <= 128),
+            "Expect (32 <= headDim <= 1024) && (numTokensPerPage <= 128), got headDimPerCtaV=%d, headDimQk=%d, "
             "headDimV=%d, numTokensPerPage=%d",
             headDimPerCtaV, headDimQk, headDimV, numTokensPerPage);
         TLLM_CHECK_WITH_INFO(maxNumHeadsQPerKvInCta <= 128, "The maxNumHeadsQPerKvInCta <= 128 is required.");
@@ -115,19 +115,19 @@ public:
         // Bit 8  - 11: kernelType.
         // Bit 12 - 15: tileScheduler.
         // Bit 16 - 17: multiCtasKvMode.
-        // Bit 18 - 24: (headDimPerCtaV >> 5).
-        // Bit 25 - 31: (headDimQk >> 5).
-        // Bit 32 - 38: (headDimV >> 5).
-        // Bit 39 - 40: (tileSizeKv >> 6).
-        // Bit 41 - 48: numTokensPerPage.
+        // Bit 18 - 25: (headDimPerCtaV >> 3).
+        // Bit 26 - 33: (headDimQk >> 3).
+        // Bit 34 - 41: (headDimV >> 3).
+        // Bit 42 - 43: (tileSizeKv >> 6).
+        // Bit 44 - 48: (numTokensPerPage >> 3).
         // Bit 49 - 56: maxNumHeadsQPerKvInCta.
         // Bit 57 - 57: reuseSmemKForV.
         // Bit 58 - 58: uses2CtaMma.
         return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4)
             | (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12)
-            | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 5) << 18)
-            | (static_cast<uint64_t>(headDimQk >> 5) << 25) | (static_cast<uint64_t>(headDimV >> 5) << 32)
-            | (static_cast<uint64_t>(tileSizeKv >> 6) << 39) | (static_cast<uint64_t>(numTokensPerPage) << 41)
+            | (static_cast<uint64_t>(multiCtasKvMode) << 16) | (static_cast<uint64_t>(headDimPerCtaV >> 3) << 18)
+            | (static_cast<uint64_t>(headDimQk >> 3) << 26) | (static_cast<uint64_t>(headDimV >> 3) << 34)
+            | (static_cast<uint64_t>(tileSizeKv >> 6) << 42) | (static_cast<uint64_t>(numTokensPerPage >> 3) << 44)
             | (static_cast<uint64_t>(maxNumHeadsQPerKvInCta) << 49) | (static_cast<uint64_t>(reuseSmemKForV) << 57)
             | (static_cast<uint64_t>(uses2CtaMma) << 58);
     }
@@ -142,6 +142,17 @@ public:
 
     std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const
     {
+        // Some conditions to check if the kernel is supported.
+        // This is meant to avoid occupying unnecessary hashId bits.
+        if (params.mHeadDimQk % 8 != 0 || params.mHeadDimV % 8 != 0)
+        {
+            return std::make_pair(false, "HeadDimQk and HeadDimV must be divisible by 8");
+        }
+        if (params.mNumTokensPerPage % 8 != 0)
+        {
+            return std::make_pair(false, "NumTokensPerPage must be divisible by 8");
+        }
+
         // The selectKernelParams that might be updated.
         SelectKernelParams selectKernelParams{params};
         auto [hashId, info] = hashFromRunnerParams(params, selectKernelParams);
@@ -322,7 +333,7 @@ private:
                 {
                     // Consider that the first tileKv might contain tokensKv that is out of the attention window.
                     maxAttentionWindow
-                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mTileSizeKv - 1);
                 }
                 else
                 {
@@ -334,9 +345,11 @@ private:
             int const maxNumCtasPerSeqKv = (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
             // Compute numCtasPerSeqKv.
             numCtasPerSeqKv = std::min(maxNumCtasPerSeqKv,
-                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasPerSeqQ * numCtasY * numCtasZ))));
+                std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+            // Update the numCtasX.
+            numCtasX *= numCtasPerSeqKv;
             // The current total number of CTAs.
-            int totalNumCtas = numCtasPerSeqQ * numCtasPerSeqKv * numCtasZ * numCtasY;
+            int totalNumCtas = numCtasX * numCtasZ * numCtasY;
             // Disable the multiCtasKvMode if there is only one CtaKv.
             if (numCtasPerSeqKv <= 1)
             {
@@ -385,8 +398,6 @@ private:
             clusterDimX *= numCtasPerSeqKv;
         }
 
-        // Update numCtasX.
-        numCtasX *= numCtasPerSeqKv;
         // Compute the current number of CTAs in total.
         int totalNumCtas = numCtasX * numCtasZ * numCtasY;
 
@@ -413,6 +424,28 @@ private:
         return std::make_tuple(numCtasPerSeqQ, numCtasPerSeqKv, numCtasX, numCtasY, numCtasZ, clusterDimX);
     }
 
+    // Determine if we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+    bool useSwapsMmaAbMlaGenKernel(RunnerParams const& params) const
+    {
+        // Use the SwapsMmaAbForGeneration kernel for MLA generation when the following conditions are met:
+        // 1. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later).
+        // 2. The numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+
+        // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
+        // Here we assume the stepKv is 256.
+        int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + 256 - 1) / 256;
+        // The number of Ctas.
+        int const numCtas
+            = static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16));
+        // Compute numCtasPerSeqKv.
+        int const numCtasPerSeqKv
+            = std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
+        // Compute the seqLenPerCtaKv.
+        int const seqLenPerCtaKv = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
+        // Whether we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+        return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
+    }
+
     std::pair<uint64_t, std::string> hashFromRunnerParams(
         RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
@@ -424,12 +457,11 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. BatchSize x seqLenQ (numMtpTokens) x ceil(headsQPerKv, 16) * 2 <= the number of multiprocessors.
-            //    The "2" is the factor that is used to finetune the heuristic based on the benchmark results.
-            if (params.mNumHeadsQPerKv <= 32
-                || static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * tc::divUp(params.mNumHeadsQPerKv, 16))
-                        * 2
-                    <= params.mMultiProcessorCount)
+            // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
+            //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+
+            // Check the conditions.
+            if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params))
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }
@@ -437,21 +469,13 @@ private:
             {
                 // Otherwise, we use the high-throughput kernel.
                 kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
-                // The 2CTA keepsMmaAbForGeneration kernel is used when the following conditions (based on the benchmark
-                // results) are met:
-                if (params.mNumHeadsQPerKv == 128
-                    && (mDtypeQ != DATA_TYPE_E4M3
-                        || (static_cast<int32_t>(params.mBatchSize * params.mMaxSeqLenQ * 2) * 2
-                            > params.mMultiProcessorCount)))
+                // The 2CTA keepsMmaAbForGeneration kernel is used when the numHeadsQPerKv is 128.
+                if (params.mNumHeadsQPerKv == 128)
                 {
                     selectKernelParams.mUses2CtaMma = true;
                     // Each Cta only handles 256 headDimV.
                     selectKernelParams.mHeadDimPerCtaV = 256;
                 }
-                // Disable the multiCtasKvMode and use the persistent scheduler for high-throughput generation
-                // kernels.
-                selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-                selectKernelParams.mTileScheduler = TileScheduler::Persistent;
             }
         }
         else if (isGenerationKernel(params.mKernelType))

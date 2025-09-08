@@ -64,21 +64,26 @@ def run_disaggregated_workers(
     return workers_proc, ctx_servers, gen_servers
 
 
+DEFAULT_TIMEOUT_SERVER_START = 900
+DEFAULT_TIMEOUT_REQUEST = 180
+
+
 class BasicWorkerTester:
 
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180):
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START):
         self.ctx_servers = ctx_servers
         self.gen_servers = gen_servers
         self.req_timeout_secs = req_timeout_secs
         self.server_start_timeout_secs = server_start_timeout_secs
 
     async def new_session(self):
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
-            total=self.req_timeout_secs))
+        session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(force_close=True),
+            timeout=aiohttp.ClientTimeout(total=self.req_timeout_secs))
         await OpenAIDisaggServer.wait_for_all_servers_ready(
             session, self.ctx_servers, self.gen_servers,
             self.server_start_timeout_secs)
@@ -146,8 +151,8 @@ class ConditionalWorkerTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
                          server_start_timeout_secs)
@@ -199,8 +204,8 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 240,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                  model_path: Optional[str] = None):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
@@ -293,7 +298,8 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
 
         if check_match_count:
             assert ctx_match_count > 0
-            assert gen_match_count >= ctx_match_count
+            assert gen_match_count > 0
+            assert gen_match_count >= ctx_match_count or gen_evicted
         return request["prompt"]
 
     async def test_multi_round_request(self,
@@ -305,6 +311,8 @@ class KvCacheEventWorkerTester(BasicWorkerTester):
                 for prompt in init_prompts
             ]
             prompts = await asyncio.gather(*chat_threads)
+            # send a request to flush events
+            await self.multi_round_request(session, init_prompts[0], 1, False)
             await asyncio.gather(*[
                 self.multi_round_request(session, prompt, 1, True)
                 for prompt in prompts
@@ -316,8 +324,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
     def __init__(self,
                  ctx_servers: List[str],
                  gen_servers: List[str],
-                 req_timeout_secs: int = 180,
-                 server_start_timeout_secs: int = 180,
+                 req_timeout_secs: int = DEFAULT_TIMEOUT_REQUEST,
+                 server_start_timeout_secs: int = DEFAULT_TIMEOUT_SERVER_START,
                  model_name: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                  tokens_per_block: int = 32):
         super().__init__(ctx_servers, gen_servers, req_timeout_secs,
@@ -401,7 +409,7 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
             # send a dummy request for initialization
             dummy_request = {
                 "model": self.model_name,
-                "prompt": [3] * 200,
+                "prompt": [3] * 2000,
                 "max_tokens": 1,
                 "ignore_eos": True,
                 "temperature": 0.0,
@@ -426,15 +434,16 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
                                                prompt=dummy_request["prompt"])
             server, info = await self.gen_router.get_next_server(openai_request)
             first_match = info["matches"][0]
+            logger.info(f"Matched blocks: {first_match}")
             assert first_match > 0
             await self.gen_router.finish_request(openai_request)
 
             # flood requests until eviction
-            batch_size = 8
+            batch_size = 64
             blocks_per_request = 32
             requests = [copy.copy(dummy_request) for _ in range(batch_size)]
             has_evicted = False
-            for i in range(0, block_pool_size // blocks_per_request + 10,
+            for i in range(0, block_pool_size // blocks_per_request * 2,
                            batch_size):
                 logger.info(f"Flooding request {i} ~ {i + batch_size - 1}")
                 prompt_len = self.gen_router._tokens_per_block * blocks_per_request - 10
@@ -454,6 +463,8 @@ class KvCacheAwareRouterTester(BasicWorkerTester):
 
             # the dummy request's reusable length decreases after eviction
             server, info = await self.gen_router.get_next_server(openai_request)
+            logger.info(
+                f"Matched blocks: {first_match} -> {info['matches'][0]}")
             assert info["matches"][0] < first_match
 
 

@@ -18,9 +18,9 @@
 
 #include "tensorrt_llm/runtime/cudaEvent.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/eagleBuffers.h"
-#include "tensorrt_llm/runtime/explicitDraftTokensBuffers.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 #include <memory>
 #include <vector>
@@ -72,25 +72,6 @@ public:
 
     //! Batch of active decoder slots, sorted by slots, [maxDecoderSteps][batchSize]
     std::vector<TensorPtr> batchSlots;
-    //! Filled with slots in request order, [batchSize]
-    TensorPtr batchSlotsRequestOrder;
-
-    //! For Beam Search
-    //! The generation step of each request (for Variable-Beam-Width-Search), [batchSize]
-    std::vector<SizeType32> generationSteps;
-
-    //! For speculative decoding
-    //! Logits of draft
-    //! [maxBatchSize][maxAcceptedDraftTokensPerStep][maxDraftTokens + 1, vocabSizePadded]
-    std::vector<std::vector<TensorPtr>> predictedDraftLogits;
-
-    //! Explicit draft tokens data
-    std::optional<ExplicitDraftTokensBuffers::EngineOutputs> explicitDraftTokensInputs;
-    std::optional<ExplicitDraftTokensBuffers::EngineInputs> explicitDraftTokensLastInputs;
-
-    //! Eagle data
-    std::optional<EagleBuffers::EngineOutputs> eagleInputs;
-    std::optional<EagleBuffers::Inputs> eagleLastInputs;
 };
 
 } // namespace decoder_batch
@@ -105,7 +86,7 @@ public:
     using TensorPtr = std::shared_ptr<ITensor>;
 
     //! @brief Setup the decoder before calling `forward()`
-    virtual void setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+    virtual void setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
         nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
         = 0;
 

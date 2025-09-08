@@ -1,22 +1,24 @@
-from typing import Any, Dict, Generic, Optional, Tuple
+from typing import Dict, Generic, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
+from transformers import LlamaConfig, PretrainedConfig
 
-from tensorrt_llm.functional import PositionEmbeddingType
-
+from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
 from ..speculative import SpecMetadata, get_spec_worker
+from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
@@ -153,10 +155,12 @@ class Eagle3DraftModel(DecoderModel):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = Linear(self.hidden_size_in * 3,
-                         config.hidden_size,
-                         bias=getattr(config, "bias", False),
-                         dtype=config.torch_dtype)
+        if self.spec_config.num_capture_layers > 1:
+            self.fc = Linear(self.hidden_size_in *
+                             self.spec_config.num_capture_layers,
+                             config.hidden_size,
+                             bias=getattr(config, "bias", False),
+                             dtype=config.torch_dtype)
 
         self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
 
@@ -264,7 +268,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
         new_weights = {}
         for k, v in weights.items():
             if 'lm_head' not in k:
@@ -274,9 +278,12 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
                 new_k = k
             new_weights[new_k] = v
         if self.load_lm_head_from_target:
-            super().load_weights(new_weights, skip_modules=['lm_head'])
+            super().load_weights(weights=new_weights,
+                                 weight_mapper=weight_mapper,
+                                 skip_modules=['lm_head'])
         else:
-            super().load_weights(new_weights)
+            super().load_weights(weights=new_weights,
+                                 weight_mapper=weight_mapper)
 
     def load_weights_from_target_model(self,
                                        target_model: torch.nn.Module) -> None:
@@ -284,18 +291,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
             self.model.embed_tokens = target_model.model.embed_tokens
         if self.load_lm_head_from_target:
             self.lm_head = target_model.lm_head
-
-    # TODO: should input/position IDs be included in this? Keeping it implicit
-    # for now since the shapes/dtypes are the same across all models we have.
-    def get_warmup_extra_inputs(self, batch_size: int,
-                                num_tokens: int) -> Dict[str, Any]:
-
-        hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size,
-                                    dtype=self.model.dtype,
-                                    device='cuda')
-
-        return {'hidden_states': hidden_states}
 
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
@@ -315,14 +310,48 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         return hidden_states
 
 
-def get_draft_model(model_config, draft_config):
+class MTPForCausalLM(nn.Module):
+
+    def __init__(
+        self,
+        model_config: ModelConfig[PretrainedConfig],
+        start_layer_idx: int = 0,
+        lm_head: nn.Module = None,
+        model: nn.Module = None,
+    ):
+        super().__init__()
+        # Import here to avoid circular import
+        from .modeling_deepseekv3 import DeepseekV3MTP
+
+        spec_dec_mode = model_config.spec_config.spec_dec_mode
+        assert spec_dec_mode.is_mtp()
+        mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle(
+        ) else model_config.spec_config.num_nextn_predict_layers
+
+        moe_load_balancer_set_repeated_for_next_layer(
+            model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
+
+        self.mtp_layers = nn.ModuleList([
+            DeepseekV3MTP(model_config, layer_idx + start_layer_idx,
+                          model.aux_stream_dict)
+            for layer_idx in range(mtp_num_layers)
+        ])
+        self.lm_head = lm_head
+        self.embed_tokens = model.embed_tokens
+
+
+def get_draft_model(model_config, draft_config, lm_head, model):
     assert getattr(model_config, 'spec_config', None) != None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
         return Eagle3ForCausalLM(
             draft_config, model_config.pretrained_config.num_hidden_layers)
+    elif spec_dec_mode.is_mtp():
+        return MTPForCausalLM(model_config,
+                              model_config.pretrained_config.num_hidden_layers,
+                              lm_head, model)
     else:
-        raise NotImplemented(
+        raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
         )
 
@@ -336,25 +365,33 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self.draft_model = None
-        if getattr(
-                model_config, 'spec_config', None
-        ) and model_config.spec_config.spec_dec_mode.use_one_engine():
-            draft_config = ModelConfig.from_pretrained(
-                model_config.spec_config.draft_model_path,
-                trust_remote_code=True,
-                attn_backend=model_config.attn_backend,
-                moe_backend=model_config.moe_backend,
-                mapping=model_config.mapping,
-                spec_config=model_config.spec_config,
-                max_num_tokens=model_config.max_num_tokens,
-                moe_max_num_tokens=model_config.moe_max_num_tokens)
-
-            draft_config.quant_config.kv_cache_quant_algo = \
+        spec_config = getattr(model_config, 'spec_config', None)
+        if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            draft_config = None
+            if spec_config.spec_dec_mode.is_eagle3_one_model():
+                draft_config = ModelConfig.from_pretrained(
+                    model_config.spec_config.speculative_model_dir,
+                    trust_remote_code=True,
+                    attn_backend=model_config.attn_backend,
+                    moe_backend=model_config.moe_backend,
+                    mapping=model_config.mapping,
+                    spec_config=model_config.spec_config,
+                    max_num_tokens=model_config.max_num_tokens,
+                    moe_max_num_tokens=model_config.moe_max_num_tokens)
+                draft_config.quant_config.kv_cache_quant_algo = \
                 model_config.quant_config.kv_cache_quant_algo
 
-            self.draft_model = get_draft_model(model_config, draft_config)
+            self.draft_model = get_draft_model(model_config, draft_config,
+                                               self.lm_head, self.model)
             self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config,
                                                model_config.mapping)
+
+            if draft_config is not None:
+                for key, value in draft_config.extra_attrs.items():
+                    assert key in ('attn_layers', 'mla_layers')
+                    assert key in model_config.extra_attrs
+                    model_config.extra_attrs[key].update(value)
 
     def forward(
         self,
@@ -375,6 +412,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         if self.draft_model is not None:
             # get logits
             logits = self.logits_processor.forward(
@@ -383,9 +423,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
+            mtp_input_ids = input_ids
+            mtp_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if input_ids is not None:
+                    # Slice along the first dimension
+                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                if position_ids is not None:
+                    # Slice along the last dimension
+                    mtp_position_ids = position_ids[:, :attn_metadata.
+                                                    num_tokens]
+
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=input_ids,
-                                    position_ids=position_ids,
+            return self.spec_worker(input_ids=mtp_input_ids,
+                                    position_ids=mtp_position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,
@@ -401,9 +452,22 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
         return logits
 
-    def load_weights(self, weights: Dict):
-        super().load_weights(weights, skip_modules=["draft_model"])
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional[BaseWeightMapper] = None):
+        super().load_weights(weights=weights,
+                             weight_mapper=weight_mapper,
+                             skip_modules=["draft_model"])
 
-    def load_draft_weights(self, weights: Dict):
-        self.draft_model.load_weights(weights)
+    def load_draft_weights(self,
+                           weights: Dict,
+                           weight_mapper: Optional[BaseWeightMapper] = None):
+        self.draft_model.load_weights(weights=weights,
+                                      weight_mapper=weight_mapper)
         self.draft_model.load_weights_from_target_model(self)
+
+    def set_guided_decoder(self,
+                           guided_decoder: CapturableGuidedDecoder) -> bool:
+        if hasattr(self.spec_worker, "set_guided_decoder"):
+            return self.spec_worker.set_guided_decoder(guided_decoder)
+        return False

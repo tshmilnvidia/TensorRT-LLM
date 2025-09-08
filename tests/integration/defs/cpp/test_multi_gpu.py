@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import defs.cpp.cpp_common as _cpp
 import pytest
+from defs.conftest import skip_no_nvls
 
 
 # Helper filter for disagg google tests
@@ -49,7 +50,7 @@ def get_multi_gpu_env(kv_cache_type=KVCacheType.NONE, llama_multi_gpu=False):
 
 def run_mpi_utils_tests(build_dir, timeout=300):
 
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
     mgpu_env = get_multi_gpu_env()
 
     mpi_utils_test = [
@@ -65,12 +66,34 @@ def run_mpi_utils_tests(build_dir, timeout=300):
                      timeout=timeout)
 
 
+def run_gemm_allreduce_tests(build_dir, nprocs, timeout=300):
+
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
+    mgpu_env = get_multi_gpu_env()
+
+    gemm_allreduce_test = [
+        "mpirun",
+        "-n",
+        f"{nprocs}",
+        "--allow-run-as-root",
+        "kernels/gemmAllReduceTest",
+        "--m=2032",
+        "--n=8200",
+        "--k=1024",
+        "--iterations=1",
+    ]
+    _cpp.run_command(gemm_allreduce_test,
+                     cwd=tests_dir,
+                     env=mgpu_env,
+                     timeout=timeout)
+
+
 def run_cache_transceiver_tests(build_dir: _pl.Path,
                                 nprocs=2,
                                 kv_cache_type=KVCacheType.MPI,
                                 timeout=600):
 
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
     mgpu_env = get_multi_gpu_env(kv_cache_type=kv_cache_type)
 
     cache_trans_test = [
@@ -78,15 +101,13 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
         "-n",
         f"{nprocs}",
         "--allow-run-as-root",
-        "batch_manager/cacheTransceiverTest",
+        "cacheTransceiverTest",
     ]
     _cpp.run_command(cache_trans_test,
                      cwd=tests_dir,
                      env=mgpu_env,
                      timeout=timeout)
 
-    # TODO: Re-enable it after the NIXL backend has stabilized.
-    '''
     # Nixl transfer agent tests
     new_env = get_multi_gpu_env(kv_cache_type=KVCacheType.NIXL)
 
@@ -96,17 +117,34 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
         "-n",
         "8",
         "--allow-run-as-root",
-        "batch_manager/cacheTransceiverTest",
+        "cacheTransceiverTest",
     ]
     _cpp.run_command(cache_trans_test_8_proc,
                      cwd=tests_dir,
                      env=new_env,
                      timeout=600)
-    '''
+
+
+def run_user_buffer_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
+    mgpu_env = get_multi_gpu_env()
+
+    user_buffer_test = [
+        "mpirun",
+        "-n",
+        f"{nprocs}",
+        "--allow-run-as-root",
+        "userBufferTest",
+    ]
+
+    _cpp.run_command(user_buffer_test,
+                     cwd=tests_dir,
+                     env=mgpu_env,
+                     timeout=timeout)
 
 
 def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
@@ -125,7 +163,7 @@ def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
 
 
 def run_llama_executor_orchestrator_tests(build_dir: _pl.Path, timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
@@ -140,7 +178,7 @@ def run_llama_executor_orchestrator_tests(build_dir: _pl.Path, timeout=1500):
 
 
 def run_llama_executor_logits_proc_tests(build_dir: _pl.Path, timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
@@ -167,7 +205,7 @@ def run_llama_executor_logits_proc_tests(build_dir: _pl.Path, timeout=1500):
 
 
 def run_llama_executor_guided_decoding_tests(build_dir: _pl.Path, timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     mgpu_env = get_multi_gpu_env(llama_multi_gpu=True)
 
@@ -194,7 +232,7 @@ def run_llama_executor_guided_decoding_tests(build_dir: _pl.Path, timeout=1500):
 
 
 def run_enc_dec_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
     cpp_env = {**_os.environ}
 
     #EncDec test in leader mode
@@ -213,7 +251,7 @@ def run_enc_dec_multi_gpu_tests(build_dir: _pl.Path, timeout=1500):
 
 def run_trt_gpt_model_real_decoder_multi_gpu_tests(build_dir: _pl.Path,
                                                    timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
     cpp_env = {**_os.environ}
 
     xml_output_file = build_dir / "results-multi-gpu-real-decoder.xml"
@@ -236,7 +274,7 @@ def run_disagg_symmetric_executor_tests(build_dir: _pl.Path,
                                         nprocs=2,
                                         kvcache_type=KVCacheType.MPI,
                                         timeout=1500):
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     prefix = get_model_test_filter_prefix(model)
 
@@ -265,7 +303,7 @@ def run_disagg_asymmetric_executor_tests(build_dir: _pl.Path,
                                          kvcache_type=KVCacheType.MPI,
                                          timeout=1500):
 
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     prefix = get_model_test_filter_prefix(model)
 
@@ -294,7 +332,7 @@ def run_disagg_orchestrator_params_tests(build_dir: _pl.Path,
                                          kvcache_type=KVCacheType.MPI,
                                          timeout=1500):
 
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     prefix = get_model_test_filter_prefix(model)
 
@@ -321,7 +359,7 @@ def run_disagg_spawn_orchestrator_tests(build_dir: _pl.Path,
                                         kvcache_type=False,
                                         timeout=1500):
 
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     prefix = get_model_test_filter_prefix(model)
 
@@ -332,7 +370,7 @@ def run_disagg_spawn_orchestrator_tests(build_dir: _pl.Path,
 
     comms = [
         "executor/disaggExecutorTest",
-        f"--gtest_filter=*{prefix}*DisaaggSpawnOrchestrator*",
+        f"--gtest_filter=*{prefix}*DisaggSpawnOrchestrator*",
         f"--gtest_output=xml:{xml_output_file}"
     ]
     _cpp.run_command(comms, cwd=tests_dir, env=mgpu_env, timeout=timeout)
@@ -451,6 +489,15 @@ def test_mpi_utils(build_google_tests, build_dir):
         run_mpi_utils_tests(build_dir, timeout=300)
 
 
+@skip_no_nvls
+@pytest.mark.parametrize("build_google_tests", ["90", "100"], indirect=True)
+@pytest.mark.parametrize("nprocs", [2, 4], ids=["2proc", "4proc"])
+def test_fused_gemm_allreduce(build_google_tests, nprocs, build_dir):
+
+    if platform.system() != "Windows":
+        run_gemm_allreduce_tests(build_dir, nprocs, timeout=300)
+
+
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
 @pytest.mark.parametrize("kvcache_type", [KVCacheType.MPI, KVCacheType.UCX],
@@ -459,11 +506,19 @@ def test_mpi_utils(build_google_tests, build_dir):
 def test_cache_transceiver(build_google_tests, nprocs, kvcache_type, build_dir):
 
     if platform.system() != "Windows":
-
         run_cache_transceiver_tests(build_dir=build_dir,
                                     nprocs=nprocs,
                                     kv_cache_type=kvcache_type,
                                     timeout=600)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("nprocs", [2, 8], ids=["2proc", "8proc"])
+def test_user_buffer(build_google_tests, nprocs, build_dir):
+
+    if platform.system() != "Windows":
+        run_user_buffer_tests(build_dir=build_dir, nprocs=nprocs, timeout=300)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
@@ -478,12 +533,7 @@ def test_enc_dec(build_google_tests, multi_gpu_model, build_dir):
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
                          indirect=True)
-@pytest.mark.parametrize("mode", [
-    "orchestrator",
-    pytest.param(
-        "leader",
-        marks=pytest.mark.skip("https://nvbugspro.nvidia.com/bug/5026255"))
-])
+@pytest.mark.parametrize("mode", ["orchestrator", "leader"])
 @pytest.mark.parametrize("multi_gpu_model", ["llama"], indirect=True)
 def test_llama_executor(build_google_tests, multi_gpu_model, mode, lora_setup,
                         build_dir):

@@ -1,15 +1,20 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
+# isort: off
+# needed before trying to import bindings to load tensorrt_libs
+import tensorrt as trt  # noqa
+# isort: on
+
 from tensorrt_llm.bindings import executor as tllme
 
 
 @dataclass(slots=True, kw_only=True)
 class DisaggregatedParams:
-    """Disaggregated seving parameters.
+    """Disaggregated serving parameters.
 
     Args:
-        request_type (str): The type of request ("context_only" or "generation_only")
+        request_type (str): The type of request ("context_only" | "generation_only" | "context_and_generation")
         first_gen_tokens (List[int]): The first tokens of the generation request
         ctx_request_id (int): The context request id
         opaque_state(bytes): Any additional state needing to be exchanged between context and gen instances
